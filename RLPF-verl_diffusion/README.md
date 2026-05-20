@@ -50,6 +50,18 @@ pip install .
 bash example/edm_ddpo_xtb/run.sh
 ```
 
+> `run.sh` now defaults to a chemistry reward that optimizes **higher QED** and **lower SA**.  
+> To tune reward weights manually:
+```bash
+python main_edm.py --wandb --wandb_name edm_ddpo_qed_sa \
+  --reward_type qed_sa --w_qed 1.0 --w_sa 0.2 --invalid_penalty -1.0 --stability_bonus 0.1
+```
+
+> If you still want to use xTB force reward:
+```bash
+python main_edm.py --wandb --wandb_name edm_ddpo_xtb --reward_type xtb
+```
+
 ### 3. Eval on QM9 molecule generation
 ```bash
 bash example/edm_ddpo_xtb/run_eval.sh
