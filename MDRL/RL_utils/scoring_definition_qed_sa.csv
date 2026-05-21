@@ -1,0 +1,3 @@
+category,name,minimize,mu,sigma,file,model,n_top,agg
+qed,qed,False,0.80,0.10,,,,
+sa,sa,True,2.80,0.60,,,,
