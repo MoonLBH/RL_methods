@@ -4,6 +4,7 @@ import numpy as np
 import torch
 from rdkit import Chem
 import csv
+import argparse
 
 
 from RL_utils.score_fuc import build_scoring_function
@@ -28,7 +29,20 @@ def save_sdf(sdf_list, sdf_dir):
             Chem.MolToMolFile(rdmol, os.path.join(sdf_dir, '%d.sdf' % i))
 
 if __name__ == '__main__':
-    device = torch.device("cuda:0")
+    parser = argparse.ArgumentParser(description="MDRL reinforcement-learning loop")
+    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--scoring_definition_path", type=str, default="./RL_utils/scoring_definition_qed_sa.csv")
+    parser.add_argument("--initial_model_ckpt_path", type=str, required=True,
+                        help="Path to pretrained diffusion ckpt, e.g. ./logs/<train_run>/checkpoints/<iter>.pt")
+    parser.add_argument("--initial_mol_path", type=str, default="./RL_utils/out/init")
+    parser.add_argument("--num_init_mols", type=int, default=3000)
+    parser.add_argument("--num_new_mols", type=int, default=2000)
+    parser.add_argument("--n_epochs", type=int, default=50)
+    parser.add_argument("--use_docking", action="store_true",
+                        help="Enable docking score. Keep disabled for pure QED+SA optimization.")
+    args = parser.parse_args()
+
+    device = torch.device(args.device)
     if device.type.startswith("cuda"):
         torch.cuda.set_device(device.index or 0)
 
@@ -40,9 +54,9 @@ if __name__ == '__main__':
     torch.cuda.manual_seed(seed)
 
     # Path
-    scoring_definition_path = "./RL_utils/scoring_definition_MEK1_mTOR_new.csv"
-    initial_model_ckpt_path = "./logs/train_MolDiff_20240506_124844/checkpoints/1600000.pt"
-    initial_mol_path = "./RL_utils/out/init"
+    scoring_definition_path = args.scoring_definition_path
+    initial_model_ckpt_path = args.initial_model_ckpt_path
+    initial_mol_path = args.initial_mol_path
 
     # Define scoring function
     # Get reinforcement objective
@@ -57,13 +71,14 @@ if __name__ == '__main__':
     # Define initial population
     if not os.path.exists(initial_mol_path):
         print("RL|The initial population does not exist, start generating the initial population.")
-        gen_list = sample(model_ckpt = initial_model_ckpt_path, num_mols = 3000, epoch_now=0)
+        gen_list = sample(model_ckpt=initial_model_ckpt_path, num_mols=args.num_init_mols, epoch_now=0)
 
         # Score the molecules in the initial population
         scores_all = 0
         dock_scores_all = 0
-        dock = True
-        print("RL|Start docking...")
+        dock = args.use_docking
+        if dock:
+            print("RL|Start docking...")
         for i in range(len(gen_list)):
             if True:
                 scores = scoring_function.score_list([gen_list[i]['smiles']])
@@ -89,7 +104,7 @@ if __name__ == '__main__':
         raise RuntimeError("RL|Use the existing initial population.")
 
 
-    n_epochs = 50
+    n_epochs = args.n_epochs
     for epoch in range(1, n_epochs):
         print(f'RL|Starting Epoch: {epoch}')
 
@@ -101,15 +116,16 @@ if __name__ == '__main__':
             ckpt_path = train_forRL(save_path, epoch, ckpt_path)
 
         # Generate a new round of molecules using a trained model
-        gen_list_new = sample(model_ckpt = ckpt_path, num_mols = 2000, epoch_now = epoch)
+        gen_list_new = sample(model_ckpt=ckpt_path, num_mols=args.num_new_mols, epoch_now=epoch)
 
         # Add a new round of molecules to the generated list of molecules, estimate scores and sort them
         scores_all = 0
         dock_scores_all = 0
-        dock = True
+        dock = args.use_docking
         gen_list = gen_list + gen_list_new
 
-        print("RL|Start docking...")
+        if dock:
+            print("RL|Start docking...")
         for i in range(len(gen_list)):
             if True:
                 scores = scoring_function.score_list([gen_list[i]['smiles']])
