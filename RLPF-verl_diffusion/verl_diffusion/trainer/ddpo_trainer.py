@@ -259,6 +259,11 @@ class DDPOTrainer(BaseTrainer):
                 for batch_idx, prompts in enumerate(self.dataloader):
                     # Process the batch
                     samples = self.process_batch(batch_idx, prompts)
+                    if isinstance(samples, list):
+                        print(f"[DDPO.debug] process_batch returned list, len={len(samples)}")
+                    if samples is None or (isinstance(samples, list) and len(samples) == 0):
+                        print(f"[DDPO.warning] Empty samples at epoch={epoch}, batch_idx={batch_idx}, skip this step.")
+                        continue
                     samples, filter_ratio, novelty_penalty_ratio = self.filters.filter(samples)
                     samples = self.compute_advantage(samples)
                     metrics = self.actor.update_policy(samples)

@@ -15,6 +15,7 @@ from verl_diffusion.model.edm_model import EDMModel
 from verl_diffusion.dataloader.dataloader import EDMDataLoader
 from verl_diffusion.worker.rollout.edm_rollout import EDMRollout
 from verl_diffusion.worker.reward.force import ForceReward
+from verl_diffusion.worker.reward.qed_sa import QEDSAReward
 from verl_diffusion.worker.filter.filter import Filter
 from verl_diffusion.worker.actor.edm_actor import EDMActor
 
@@ -28,6 +29,11 @@ def parse_args():
     parser.add_argument('--seed', type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument('--resume', action='store_true', help="Resume training from checkpoint")
     parser.add_argument('--checkpoint_path', type=str, default=None, help="Path to checkpoint to resume from")
+    parser.add_argument('--reward_type', type=str, default="qed_sa", choices=["qed_sa", "xtb"], help="Reward function type")
+    parser.add_argument('--w_qed', type=float, default=1.0, help="Weight for QED reward")
+    parser.add_argument('--w_sa', type=float, default=0.2, help="Weight for SA penalty")
+    parser.add_argument('--invalid_penalty', type=float, default=-1.0, help="Penalty for invalid molecules")
+    parser.add_argument('--stability_bonus', type=float, default=0.1, help="Bonus for stable molecules")
     
     return parser.parse_args()
 
@@ -89,7 +95,16 @@ def main():
     # Initialize rollout and rewarder in main function
     rollout = EDMRollout(model, config)
     rollout.model.to(device)
-    rewarder = ForceReward(dataset_info)
+    if args.reward_type == "xtb":
+        rewarder = ForceReward(dataset_info)
+    else:
+        rewarder = QEDSAReward(
+            dataset_info=dataset_info,
+            w_qed=args.w_qed,
+            w_sa=args.w_sa,
+            invalid_penalty=args.invalid_penalty,
+            stability_bonus=args.stability_bonus,
+        )
     filters = Filter(dataset_info,config["dataloader"]["smiles_path"],False,False,False)
     actor = EDMActor(model, config)
     # Initialize Ray for parallel processing

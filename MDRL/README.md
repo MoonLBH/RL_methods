@@ -50,6 +50,11 @@ The parameters are:
 - `device`: the device to run the model.
 - `logdir`: the path to save the log file.
 
+Example command with the provided config:
+```bash
+python scripts/train_drug3d.py --config ./configs/train/train_MDRL.yml --device 0 --logdir ./logs/mdrl_run1
+```
+
 ### Sample
 
 The config file for sampling can be found in `./configs/sample.` To sample using model, you can run the following command:
@@ -62,6 +67,9 @@ The parameters are:
 - `device`: the device to run the model.
 - `batch_size`: the batch size for sampling. 
 
+Provided sampling config file:
+- `./configs/sample/sample_MDRL.yml`
+
 ## Reinforcement learning
 
 ### Compound-target scoring module
@@ -70,10 +78,20 @@ You can use `./RL_utils/ligand_binding_model/xgboost/xgbr_bindingdb.ipynb` to tr
 
 ### Reinforcement learning
 
-First, use `./RL_utils/scoring_definition.csv` to construct the scoring target, including ligand efficiency, SA, QED, LogP, and MW. An example is given in the file.
+First, choose a scoring-definition csv to construct the scoring target:
+- multi-target example: `./RL_utils/scoring_definition.csv`
+- QED+SA-only example: `./RL_utils/scoring_definition_qed_sa.csv`
 
-Then, you can run the reinforcement learning using following command:
-```python
-python RL_utils/01_RL.py
+Then, run reinforcement learning. For QED↑ + SA↓ optimization:
+```bash
+python RL_utils/01_RL.py \
+  --initial_model_ckpt_path ./logs/<your_pretrain_run>/checkpoints/<iter>.pt \
+  --scoring_definition_path ./RL_utils/scoring_definition_qed_sa.csv
 ```
 
+Useful optional args:
+- `--n_epochs 20`
+- `--num_init_mols 2000`
+- `--num_new_mols 1000`
+- `--device cuda:0`
+- `--use_docking` (disabled by default; keep off for pure QED+SA)
