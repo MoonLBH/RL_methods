@@ -1,180 +1,168 @@
-# RLPF xTB Reward Workflow (可迁移说明文档)
+# xTB 奖励构建说明（代码仓库无关版）
 
-本文档说明 RLPF 中 xTB 奖励是如何计算并接入 RL/DDPO 训练循环的，方便你在其他模型中复用同一思路。
-
----
-
-## 1. 在 RLPF 里，xTB 奖励由谁触发
-
-训练入口在 `main_edm.py`：当参数 `--reward_type xtb` 时，构建 `ForceReward(dataset_info)` 作为奖励器，并传给 `DDPOTrainer`。  
-即：`rollout -> rewarder -> trainer.update_policy` 的标准路径。  
-
-关键代码位置：
-- 选择奖励类型：`main_edm.py` 第 98-107 行。
-- 传给 trainer：`main_edm.py` 第 115-124 行。
+> 目标读者：将在**其他代码仓库**里实现“以 xTB 为目标的 RL 奖励”任务的人。  
+> 本文档不依赖任何特定项目源码路径，不要求读者能访问当前仓库。
 
 ---
 
-## 2. 输入数据结构（奖励器收到什么）
+## 1) 奖励目标定义（先统一口径）
 
-`EDMRollout.generate_minibatch()` 会返回 `DataProto`，其中至少包含：
-- `x`: 生成的 3D 坐标
-- `categorical`: 原子类型 one-hot
-- `nodesxsample`: 每个样本真实原子数
-- `group_index`, `latents`, `logps`, `timesteps` 等（RL/DDPO 需要）
+在分子生成/优化任务里，xTB 常见做法是把“力场残差（forces）”作为优化目标：
 
-关键代码位置：
-- `edm_rollout.py` 第 129-140 行（DataProto 输出字段）。
+- 对每个分子计算原子受力向量 `F_i`
+- 聚合为标量（常用 RMS）：
+  \[
+  s_{\text{force}}=\sqrt{\frac{1}{N}\sum_i ||F_i||^2}
+  \]
+- 强化学习奖励定义为负值：
+  \[
+  r_{\text{xtb}}=-s_{\text{force}}
+  \]
 
----
-
-## 3. xTB 奖励的逐步计算逻辑
-
-奖励实现文件：`verl_diffusion/worker/reward/force.py`。
-
-### 3.1 初始化
-
-`ForceReward.__init__` 中：
-- 建立 xTB 计算器：`XTB(method="GFN2-xTB")`
-- 保存 `dataset_info`
-- `atom_encoder = dataset_info['atom_decoder']`（把模型内部原子索引映射为元素符号）
-
-关键代码位置：
-- `force.py` 第 36-43 行。
+这样“力越小，奖励越高”，优化方向清晰。
 
 ---
 
-### 3.2 从 DataProto 还原单分子
+## 2) 你需要的最小输入/输出接口
 
-`process_data(samples)` 从 batch 中提取每个样本：
-1. `categorical.argmax(1)` 得到原子类别索引
-2. 用 `nodesxsample[i]` 截断 padding 部分
-3. 形成 `(pos, atom_type)`，其中：
-   - `pos`: `[n_atoms, 3]`
-   - `atom_type`: `[n_atoms]`
+无论你的生成模型是扩散、VAE、自回归还是图策略网络，xTB 奖励模块建议满足：
 
-关键代码位置：
-- `force.py` 第 146-165 行。
+### 输入（每个 batch）
+- `positions`: 每个分子的 3D 坐标（可还原为 `[B, N, 3]`）
+- `atom_types`: 原子类型（index 或 one-hot）
+- `num_atoms`: 每个样本的真实原子数（用于去 padding）
 
----
-
-### 3.3 单分子打分函数（Ray 远程）
-
-`@ray.remote(num_cpus=8) calcuate_xtb_force(...)` 对每个分子做：
-1. `check_stability(...)` 计算结构稳定性（返回的第一个值用于稳定分子标记）
-2. 原子索引 -> 元素符号
-3. 用 ASE `Atoms(symbols, positions)` 组装分子
-4. 绑定 xTB 计算器并执行 `atoms.get_forces()`
-5. 对力张量做 `rmsd(forces)`，得到 `mean_abs_forces`
-6. 奖励定义：`reward = -1 * mean_abs_forces`
-7. 异常容错：若 xTB 失败，`mean_abs_forces = 5.0`（等价 reward = -5.0）
-
-关键代码位置：
-- `force.py` 第 19-33 行。
-
-> 结论：**RLPF 的 xTB 奖励本质是“最小化力大小”**（因为奖励为负力 RMSD，力越小奖励越高）。
+### 输出（每个 batch）
+- `rewards`: shape `[B]`，每个分子的标量奖励
+- （可选）`stability`: shape `[B]`，结构稳定性标记/分数
+- （可选）`validity`: shape `[B]`，是否成功完成 xTB 计算
 
 ---
 
-### 3.4 批量并行与回收
+## 3) 单分子奖励计算流程（标准模板）
 
-`calculate_rewards(data)`：
-1. 先 `process_data(data)` 得到分子列表
-2. 每个分子提交一个 `ray` future 到 `calcuate_xtb_force.remote(...)`
-3. `ray.get(futures)` 回收 `(reward, stability)` 列表
-4. 组装成 `DataProto(batch=TensorDict(...))`，其中包含：
-   - `rewards`: shape `[B]`
-   - `stability`: shape `[B]`
+对 batch 中每个样本执行：
 
-关键代码位置：
-- `force.py` 第 167-191 行。
+1. **裁剪真实原子**  
+   用 `num_atoms[i]` 截断坐标和原子类型，去掉 padding。
 
----
+2. **原子类型映射**  
+   把模型内部原子 index 映射为元素符号（如 C/N/O/F/...）。
 
-## 4. 奖励如何进入策略更新
+3. **构建分子对象**  
+   使用 ASE `Atoms(symbols=..., positions=...)` 或等价结构。
 
-在 `DDPOTrainer` 中：
-1. rollout 产生 `sample`（DataProto）
-2. reward worker 线程调用 `self.rewarder.calculate_rewards(sample)`
-3. 将 sample 与 reward 结果分别 concat 后做 union
-4. `filters.filter(samples)` 可选去重/新颖性惩罚
-5. `compute_advantage(samples)` 用 `samples.batch["rewards"]` 计算 group 内标准化优势
-6. `actor.update_policy(samples)` 执行策略更新
+4. **调用 xTB 计算器**  
+   典型为 `GFN2-xTB`，执行 forces 计算。
 
-关键代码位置：
-- reward worker 调用：`ddpo_trainer.py` 第 82 行。
-- sample/reward 合并：第 150-153 行。
-- 过滤：第 267 行。
-- 优势计算使用 rewards：第 169-191 行。
-- 更新策略：第 269 行。
+5. **计算标量目标**  
+   `force_score = RMS(forces)`（或你约定的 norm 聚合方式）。
+
+6. **生成奖励**  
+   `reward = -force_score`。
+
+7. **异常处理**  
+   若 xTB 失败（SCF 不收敛、输入非法等），返回固定惩罚（例如 `-5.0`）。
 
 ---
 
-## 5. 迁移到“别的模型”时的最小接口要求
+## 4) 批量并行建议（重点，决定速度）
 
-如果你要在其他生成模型里复用 xTB 奖励，建议遵循以下接口：
+xTB 单分子计算较慢，建议：
 
-### 5.1 生成器输出（等价于 DataProto batch）
-每个 batch 至少提供：
-- `positions`: `[B, N, 3]`（或可恢复为此形状）
-- `atom_type_onehot` 或 `atom_type_index`
-- `n_atoms_per_sample`: `[B]`（去除 padding）
+- **并行粒度**：一分子一个任务（进程/worker）
+- **调度方式**：`ray` / `multiprocessing` / 作业队列均可
+- **批量回收**：提交 futures 后统一回收结果，减少同步开销
 
-### 5.2 奖励器输入输出
-- 输入：一个 batch（可迭代到单分子）
-- 输出：至少 `rewards: [B]`
-- 可选输出：`stability: [B]`（用于日志或联合目标）
-
-### 5.3 单分子计算步骤复用
-1. 截断真实原子
-2. 原子类型映射为元素符号
-3. 构建 `ase.Atoms`
-4. `XTB(method="GFN2-xTB")` + `get_forces()`
-5. `reward = -rmsd(forces)`
-6. 异常给固定负值惩罚（如 -5）
+实践上通常做两层控制：
+- `max_workers`：并发 worker 数
+- `timeout/retry`：单任务超时与重试策略
 
 ---
 
-## 6. 可直接复用的伪代码（框架无关）
+## 5) 数值鲁棒性与失败策略
+
+必须明确 3 件事：
+
+1. **失败惩罚值是多少**（例如 `-5.0`）  
+2. **失败样本是否计入 replay/update**（建议计入，但带惩罚）  
+3. **日志里单独统计失败率**（否则 reward 均值会误导）
+
+建议日志至少包含：
+- `reward_mean`, `reward_std`
+- `xtb_fail_ratio`
+- `stability_mean`（如果有）
+- 每 step/epoch 的 wall time
+
+---
+
+## 6) 与多目标奖励融合（常见需求）
+
+如果你还要联合 QED/SA/对接分数，可用线性加权：
+
+\[
+r = w_{\text{xtb}}\,r_{\text{xtb}} + w_{\text{qed}}\,r_{\text{qed}} - w_{\text{sa}}\,s_{\text{sa}} + ...
+\]
+
+经验建议：
+- 先把各子目标做范围归一化（例如 z-score / min-max）
+- 再调权重，否则某一项会数值主导训练
+
+---
+
+## 7) 代码无关伪代码（可直接迁移）
 
 ```python
-def xtb_reward_batch(batch):
-    rewards, stability = [], []
-    for mol in batch:
-        pos, atom_idx, n = mol["pos"], mol["atom_idx"], mol["n_atoms"]
-        pos = pos[:n]
-        atom_idx = atom_idx[:n]
-        stable = check_stability(pos, atom_idx, dataset_info)[0]
+def compute_xtb_rewards(batch, atom_decoder, xtb_calc, fail_penalty=-5.0):
+    rewards = []
+    validity = []
+    for i in range(len(batch)):
+        pos = batch.positions[i][: batch.num_atoms[i]]
+        typ = batch.atom_types[i][: batch.num_atoms[i]]
         try:
-            symbols = [atom_decoder[i] for i in atom_idx]
+            symbols = [atom_decoder[t] for t in typ]
             atoms = Atoms(symbols=symbols, positions=pos)
-            atoms.calc = XTB(method="GFN2-xTB")
+            atoms.calc = xtb_calc
             forces = atoms.get_forces()
-            r = -rmsd(forces)
+            force_rms = rms(forces)         # sqrt(mean(||F_i||^2))
+            r = -force_rms
+            v = 1.0
         except Exception:
-            r = -5.0
+            r = fail_penalty
+            v = 0.0
         rewards.append(r)
-        stability.append(float(stable))
-    return {"rewards": rewards, "stability": stability}
+        validity.append(v)
+    return rewards, validity
 ```
 
 ---
 
-## 7. 实践建议（跨任务复用时）
+## 8) 交付给其他仓库时的“最小落地清单”
 
-1. **先做小 batch 烟雾测试**：确认每个分子都能正确转为 `Atoms`，避免训练中频繁异常回退。  
-2. **并行策略**：RLPF 用 Ray；你也可以换成多进程池，但保持“一分子一任务 + 批量回收”思路。  
-3. **异常惩罚值**：`-5.0` 是当前实现里的经验值，可根据任务分布调整。  
-4. **可混合目标**：将 xTB 奖励与 QED/SA 等做加权和（如 `r = w_xtb*r_xtb + w_qed*r_qed - w_sa*sa`）。  
-5. **日志监控**：至少记录 `reward mean/std` 与 `stability mean`，便于定位是否只学到“规避失败样本”。  
+把下面 8 项给到对方，基本就能落地：
+
+1. 原子 index -> 元素符号映射表  
+2. batch 中真实原子数字段定义  
+3. xTB 方法（通常 GFN2-xTB）  
+4. force 聚合方式（RMS / mean norm）  
+5. 奖励符号（负号）  
+6. 失败惩罚值  
+7. 并行策略与 worker 数  
+8. 训练日志指标定义
 
 ---
 
-## 8. 代码锚点索引（便于快速跳转）
+## 9) 常见坑（迁移时高频）
 
-- 奖励入口选择：`RLPF-verl_diffusion/main_edm.py`
-- xTB 奖励实现：`RLPF-verl_diffusion/verl_diffusion/worker/reward/force.py`
-- rollout 数据打包：`RLPF-verl_diffusion/verl_diffusion/worker/rollout/edm_rollout.py`
-- DDPO 主训练循环：`RLPF-verl_diffusion/verl_diffusion/trainer/ddpo_trainer.py`
-- 过滤器（可选）：`RLPF-verl_diffusion/verl_diffusion/worker/filter/filter.py`
+- 坐标单位/格式不一致（Å vs 其他）  
+- 原子类型映射错位（index 对不上元素）  
+- padding 未截断导致伪原子进入 xTB  
+- 并发太高导致 CPU/RAM 爆掉  
+- 把异常吞掉但不统计失败率，训练看似“稳定”实则无效
+
+---
+
+## 10) 一句话总结
+
+**把每个分子的 xTB 力 RMS 作为代价并取负作为奖励，再配合失败惩罚与并行计算，就是最稳妥、可迁移的 xTB 目标奖励实现。**
 
